@@ -439,6 +439,10 @@ class Resources(_FlagGroupBase):
     # CUDA graph memory pool shared across the prefill and decode graph
     # backends (created lazily by model_executor.runner_utils.pool).
     graph_memory_pool: Any = None
+    # Explicit CUDA pool owner used for same-thread warmup/capture reuse.
+    # Other devices/backends continue to consume the opaque handle above.
+    graph_memory_pool_owner: Any = None
+    graph_memory_pool_owner_device: Optional[int] = None
     # EPLB: per-process recorder and the publish-once location metadata
     # (owning accessors live in sglang.srt.eplb).
     expert_distribution_recorder: Any = None

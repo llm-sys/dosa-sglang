@@ -759,6 +759,10 @@ class DeepseekSparseAttnBackend(
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
+        if hasattr(self.req_to_token_pool, "_dosa_decode_generations"):
+            from .dsa.dosa_runtime.decode_witness import invalidate_prefill
+
+            invalidate_prefill(self.req_to_token_pool, forward_batch)
         seq_lens_cpu = (
             forward_batch.seq_lens.cpu() if in_capture else forward_batch.seq_lens_cpu
         )
@@ -775,6 +779,10 @@ class DeepseekSparseAttnBackend(
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
+        if hasattr(self.req_to_token_pool, "_dosa_decode_generations"):
+            from .dsa.dosa_runtime.decode_witness import invalidate_prefill
+
+            invalidate_prefill(self.req_to_token_pool, forward_batch)
         batch_size = forward_batch.batch_size
         device = forward_batch.seq_lens.device
 

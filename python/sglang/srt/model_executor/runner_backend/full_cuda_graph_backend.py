@@ -17,8 +17,9 @@ torch.cuda.CUDAGraph per shape.
 
 from __future__ import annotations
 
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import partial
+import threading
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 import torch
@@ -31,7 +32,9 @@ from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
 )
 from sglang.srt.model_executor.runner_utils.pool import (
+    get_global_graph_memory_pool_owner,
     get_or_create_global_graph_memory_pool,
+    release_unused_global_graph_memory_pool,
 )
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -58,6 +61,9 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         self._graphs: Dict[Any, torch.cuda.CUDAGraph] = {}
         self._outputs: Dict[Any, Any] = {}
         self._pool = None
+        self._pool_owner = None
+        self._capture_thread = None
+        self._allow_explicit_pool = not enable_memory_saver
         self._cuda_graph_runner = cuda_graph_runner
         self._device_module = cuda_graph_runner.device_module
         self._tp_group = cuda_graph_runner.model_runner.tp_group
@@ -70,13 +76,19 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
     @contextmanager
     def capture_session(self, stream: torch.cuda.Stream):
         if self._pool is None:
-            self._pool = get_or_create_global_graph_memory_pool(self._device_module)
+            self._pool = get_or_create_global_graph_memory_pool(
+                self._device_module,
+                allow_explicit_pool=self._allow_explicit_pool,
+            )
+        self._pool_owner = get_global_graph_memory_pool_owner(self._pool, stream.device)
         set_graph_pool_id(self._pool)
         self._capture_stream = stream
+        self._capture_thread = threading.get_ident()
         try:
             yield
         finally:
             self._capture_stream = None
+            self._capture_thread = None
 
     def capture_one(
         self,
@@ -105,13 +117,39 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         for _ in range(2):
             self._device_module.synchronize()
             self._tp_group.barrier()
-            forward_fn()
-            if profiler is not None:
-                profiler.step()
-            if post_warmup_hook is not None:
-                post_warmup_hook()
+            reuse_pool = (
+                self._allow_explicit_pool
+                and self._pool_owner is not None
+                and self._capture_stream is not None
+                and self._capture_thread == threading.get_ident()
+                and not (
+                    self._memory_saver_adapter is not None
+                    and self._memory_saver_adapter.enabled
+                )
+            )
+            # Only this launch thread is routed. The original synchronization
+            # above completes incoming work; both warmup and its hook use the
+            # eventual capture stream. No new worker thread is redirected.
+            stream_ctx = (
+                self._device_module.stream(self._capture_stream)
+                if reuse_pool else nullcontext()
+            )
+            with stream_ctx:
+                pool_ctx = (
+                    torch.cuda.use_mem_pool(
+                        self._pool_owner, device=self._capture_stream.device
+                    )
+                    if reuse_pool else nullcontext()
+                )
+                with pool_ctx:
+                    forward_fn()
+                if profiler is not None:
+                    profiler.step()
+                if post_warmup_hook is not None:
+                    post_warmup_hook()
 
         graph = torch.cuda.CUDAGraph()
+        graph._sglang_pool_owner = self._pool_owner
 
         graph_ctx: Callable[..., AbstractContextManager]
         if (
@@ -153,4 +191,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
     def cleanup(self) -> None:
         self._graphs.clear()
         self._outputs.clear()
+        pool = self._pool
         self._pool = None
+        self._pool_owner = None
+        release_unused_global_graph_memory_pool(pool)

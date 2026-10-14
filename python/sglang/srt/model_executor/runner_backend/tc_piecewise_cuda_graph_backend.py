@@ -48,6 +48,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 )
 from sglang.srt.model_executor.runner_utils.pool import (
     get_or_create_global_graph_memory_pool,
+    release_unused_global_graph_memory_pool,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_hip
@@ -91,6 +92,7 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
     def __init__(self, cuda_graph_runner: BaseCudaGraphRunner) -> None:
         model_runner = cuda_graph_runner.model_runner
         self._pool = None
+        self._allow_explicit_pool = not model_runner.server_args.enable_memory_saver
         self._device_module = cuda_graph_runner.device_module
         self._tp_group = model_runner.tp_group
         self._capture_stream: Optional[torch.cuda.Stream] = None
@@ -171,7 +173,8 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
 
                 if self._pool is None:
                     self._pool = get_or_create_global_graph_memory_pool(
-                        self._device_module
+                        self._device_module,
+                        allow_explicit_pool=self._allow_explicit_pool,
                     )
                 set_graph_pool_id(self._pool)
 
@@ -268,4 +271,6 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
         self._compiled_fn = None
         self._compile_config = None
         self._language_model = None
+        pool = self._pool
         self._pool = None
+        release_unused_global_graph_memory_pool(pool)

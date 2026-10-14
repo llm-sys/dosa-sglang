@@ -109,8 +109,8 @@ template <bool kPDL>
 CLUSTER_TOPK_KERNEL void topk_persistent_cluster_kernel(const __grid_constant__ TopKLaunchParams params) {
   device::enable_smem_spilling();
   __shared__ impl::MaxSmem<Cluster::Smem> smem;
-  const uint32_t num_cluster_items = params.global().num_cluster_items;
   device::PDLWaitPrimary<kPDL>();
+  const uint32_t num_cluster_items = params.global().num_cluster_items;
   device::PDLTriggerSecondary<kPDL>();
 #pragma unroll 1
   for (uint32_t w = blockIdx.x; w < num_cluster_items; w += kNumPersistentClusters) {
@@ -163,6 +163,7 @@ SGL_DEVICE void problem_transform(TopKProblem& problem, int32_t* output_ptr) {
 template <bool kPDL, int kLevel>
 TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKLaunchParams params) {
   device::enable_smem_spilling();
+  device::PDLWaitPrimary<kPDL>();
   auto problem = params.problem(blockIdx.x);
   constexpr uint32_t kU32Max = std::numeric_limits<uint32_t>::max();
   __shared__ impl::MaxSmem<Register2::Smem, Register4::Smem, Streaming::Smem> smem;
@@ -204,6 +205,7 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKLaunchParams param
 template <bool kPDL>
 CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const __grid_constant__ TopKLaunchParams params) {
   device::enable_smem_spilling();
+  device::PDLWaitPrimary<kPDL>();
   auto problem = params.problem(blockIdx.x);
   __shared__ impl::MaxSmem<Streaming::Smem, Cluster::Smem> smem;
   if (problem.seq_len <= problem.topk) return trivial_transform<kPDL>(problem);
@@ -357,14 +359,15 @@ struct TopKKernel {
         static_cluster_threshold);
   }
 
-  static void transform(
+  static bool transform_impl(
       const tvm::ffi::TensorView scores,
       const tvm::ffi::TensorView seq_lens,
       const tvm::ffi::TensorView page_table,
       const tvm::ffi::TensorView page_indices,
       const uint32_t page_size,
       const tvm::ffi::TensorView metadata,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> raw_indices) {
+      const tvm::ffi::Optional<tvm::ffi::TensorView> raw_indices,
+      const bool unplanned) {
     using namespace host;
     auto B = SymbolicSize{"batch_size"};
     auto Bp1 = SymbolicSize{"batch_size_plus_1"};
@@ -437,34 +440,66 @@ struct TopKKernel {
     };
 
     const bool use_cluster = (max_seq_len > params.cluster_floor) && (batch_size <= kClusterMaxBatch);
-    constexpr bool kUsePDL = true;
-    if (use_cluster) {
-      if (batch_size <= kNumPersistentClusters) {
-        LaunchKernel({batch_size, kClusterSize}, kBlockSize, device)
-            .config({.use_pdl = kUsePDL, .cluster_dim = dim3{1, kClusterSize}})
-            .launch(topk_small_batch_kernel<kUsePDL>, params);
-      } else {
-        const uint32_t num_clusters = std::min(batch_size, kNumPersistentClusters);
-        LaunchKernel({num_clusters, kClusterSize}, kBlockSize, device)
-            .config({.use_pdl = kUsePDL, .cluster_dim = dim3{1, kClusterSize}})
-            .launch(topk_persistent_cluster_kernel<kUsePDL>, params);
+    // Only the persistent pool and its epilogue read routing metadata.
+    // The fused per-row, register and streaming paths use actual seq_lens.
+    if (unplanned && use_cluster && batch_size > kNumPersistentClusters) return false;
+    // Unplanned lengths are produced by the immediately preceding compaction.
+    // Normal stream ordering supplies the dependency without speculative PDL
+    // metadata reads. The existing planned path retains PDL.
+    const auto launch = [&]<bool kUsePDL>() {
+      if (use_cluster) {
+        if (batch_size <= kNumPersistentClusters) {
+          LaunchKernel({batch_size, kClusterSize}, kBlockSize, device)
+              .config({.use_pdl = kUsePDL, .cluster_dim = dim3{1, kClusterSize}})
+              .launch(topk_small_batch_kernel<kUsePDL>, params);
+        } else {
+          const uint32_t num_clusters = std::min(batch_size, kNumPersistentClusters);
+          LaunchKernel({num_clusters, kClusterSize}, kBlockSize, device)
+              .config({.use_pdl = kUsePDL, .cluster_dim = dim3{1, kClusterSize}})
+              .launch(topk_persistent_cluster_kernel<kUsePDL>, params);
+          LaunchKernel(batch_size, kBlockSize, device)
+              .config({.use_pdl = kUsePDL})
+              .launch(topk_main_kernel<kUsePDL, /*kLevel=*/3>, params);
+        }
+      } else if (max_seq_len <= kReg2MaxSeqLen) {
         LaunchKernel(batch_size, kBlockSize, device)
             .config({.use_pdl = kUsePDL})
-            .launch(topk_main_kernel<kUsePDL, /*kLevel=*/3>, params);
+            .launch(topk_main_kernel<kUsePDL, /*kLevel=*/0>, params);
+      } else if (max_seq_len <= kReg4MaxSeqLen) {
+        LaunchKernel(batch_size, kBlockSize, device)
+            .config({.use_pdl = kUsePDL})
+            .launch(topk_main_kernel<kUsePDL, /*kLevel=*/1>, params);
+      } else {
+        LaunchKernel(batch_size, kBlockSize, device)
+            .config({.use_pdl = kUsePDL})
+            .launch(topk_main_kernel<kUsePDL, /*kLevel=*/2>, params);
       }
-    } else if (max_seq_len <= kReg2MaxSeqLen) {
-      LaunchKernel(batch_size, kBlockSize, device)
-          .config({.use_pdl = kUsePDL})
-          .launch(topk_main_kernel<kUsePDL, /*kLevel=*/0>, params);
-    } else if (max_seq_len <= kReg4MaxSeqLen) {
-      LaunchKernel(batch_size, kBlockSize, device)
-          .config({.use_pdl = kUsePDL})
-          .launch(topk_main_kernel<kUsePDL, /*kLevel=*/1>, params);
-    } else {
-      LaunchKernel(batch_size, kBlockSize, device)
-          .config({.use_pdl = kUsePDL})
-          .launch(topk_main_kernel<kUsePDL, /*kLevel=*/2>, params);
-    }
+    };
+    if (unplanned) launch.template operator()<false>();
+    else launch.template operator()<true>();
+    return true;
+  }
+
+  static void transform(
+      const tvm::ffi::TensorView scores,
+      const tvm::ffi::TensorView seq_lens,
+      const tvm::ffi::TensorView page_table,
+      const tvm::ffi::TensorView page_indices,
+      const uint32_t page_size,
+      const tvm::ffi::TensorView metadata,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> raw_indices) {
+    transform_impl(scores, seq_lens, page_table, page_indices, page_size, metadata, raw_indices, false);
+  }
+
+  static bool try_transform_unplanned(
+      const tvm::ffi::TensorView scores,
+      const tvm::ffi::TensorView seq_lens,
+      const tvm::ffi::TensorView page_table,
+      const tvm::ffi::TensorView page_indices,
+      const uint32_t page_size,
+      const tvm::ffi::TensorView metadata,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> raw_indices) {
+    return transform_impl(scores, seq_lens, page_table, page_indices, page_size, metadata, raw_indices, true);
   }
 };
 
