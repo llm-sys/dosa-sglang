@@ -40,6 +40,7 @@ def _jit_topk_v2_module():
         cuda_files=["deepseek_v4/topk_v2.cuh"],
         cuda_wrappers=[
             ("topk_transform", "TopKKernel::transform"),
+            ("topk_try_unplanned", "TopKKernel::try_transform_unplanned"),
             ("topk_plan", "TopKKernel::plan"),
         ],
     )
@@ -92,14 +93,15 @@ def topk_transform_512_v2(
     page_tables: torch.Tensor,
     out_page_indices: torch.Tensor,
     page_size: int,
-    metadata: torch.Tensor,
+    metadata: Optional[torch.Tensor] = None,
     out_raw_indices: Optional[torch.Tensor] = None,
 ) -> None:
     """Fused top-k + page-table transform (DeepSeek-V4 top-k v2 kernel).
 
-    IMPORTANT: every entry of ``seq_lens`` must be NON-NEGATIVE, and
-    ``metadata`` must come from :func:`plan_topk_v2` over the same ``seq_lens``
-    values. The kernel reads lengths as ``uint32_t``: a negative entry
+    Every length must be NON-NEGATIVE. An explicit ``metadata`` must come
+    from :func:`plan_topk_v2` over the same lengths. When omitted, host dispatch
+    skips planning only on kernels that do not consume it; the persistent pool
+    still constructs its required plan. The kernel reads lengths as ``uint32_t``: a negative entry
     reinterprets as a ~4e9-token sequence, sending the row down the cluster
     path over garbage scores and crashing with an illegal memory access
     (GLM 5.2 MTP DP-idle companion rows hit exactly this). A length of 0 is
@@ -107,6 +109,14 @@ def topk_transform_512_v2(
     the output is all -1.
     """
     module = _jit_topk_v2_module()
+    if metadata is None:
+        scratch = seq_lens.new_empty(seq_lens.shape[0] + 1, 2)
+        if module.topk_try_unplanned(
+            scores, seq_lens, page_tables, out_page_indices, page_size,
+            scratch, out_raw_indices,
+        ):
+            return
+        metadata = plan_topk_v2(seq_lens)
     module.topk_transform(
         scores,
         seq_lens,

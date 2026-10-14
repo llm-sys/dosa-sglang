@@ -41,6 +41,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 )
 from sglang.srt.model_executor.runner_utils.pool import (
     get_or_create_global_graph_memory_pool,
+    release_unused_global_graph_memory_pool,
 )
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -70,6 +71,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         self._outputs: Dict[Any, Any] = {}
         self._capture_inputs: Dict[Any, Any] = {}
         self._pool = None
+        self._allow_explicit_pool = not enable_memory_saver
         self._device_module = cuda_graph_runner.device_module
         self._tp_group = cuda_graph_runner.model_runner.tp_group
         self._capture_stream: Optional[torch.cuda.Stream] = None
@@ -90,7 +92,9 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
     @contextmanager
     def capture_session(self, stream: torch.cuda.Stream):
         if self._pool is None:
-            self._pool = get_or_create_global_graph_memory_pool(self._device_module)
+            self._pool = get_or_create_global_graph_memory_pool(
+                self._device_module, allow_explicit_pool=self._allow_explicit_pool
+            )
         set_graph_pool_id(self._pool)
         self._capture_stream = stream
         self._shared_output_buffer = None
@@ -253,5 +257,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         self._graphs.clear()
         self._outputs.clear()
         self._capture_inputs.clear()
+        pool = self._pool
         self._pool = None
         self._shared_output_buffer = None
+        release_unused_global_graph_memory_pool(pool)

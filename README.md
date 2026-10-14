@@ -1,3 +1,13 @@
+# DoSA on SGLang v0.5.18
+
+This branch preserves the complete official SGLang v0.5.18 history and adds the
+verified DoSA prefill implementation with bounded candidate storage.
+
+See [GLM-5.2 TTFT reproduction](benchmark/dosa/README.md) for the exact inputs,
+installation, two-node launch commands, and baseline/DoSA results.
+
+---
+
 <div align="center" id="sglangtop">
 <img src="https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png" alt="logo" width="400" margin="10px"></img>
 

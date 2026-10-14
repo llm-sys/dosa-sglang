@@ -431,6 +431,7 @@ struct TopKRadixBase : TopKConfig {
     alignas(128) uint32_t count_eq;
     alignas(128) uint32_t count_gt;
     uint32_t threshold_bin;
+    uint32_t bucket_overflow;
     uint32_t warp_sum[kNumWarps];
     // The coarse histogram is dead once find_threshold() has published
     // threshold_bin, and the tie machinery only comes alive after that: the
@@ -478,6 +479,79 @@ struct TopKRadixBase : TopKConfig {
     }
   }
 
+  struct Bounds { float lo, hi; };
+
+  // The coarse bucket is a range of different FP32 values, not an exact tie.
+  // Narrow an overflowing bucket before collecting into the bounded tie arena.
+  // Every radix pass is over the complete active exact-key prefix; no candidate
+  // is dropped due to the arena capacity. At shift zero all remaining ties are
+  // identical FP32 keys, so retaining topk of them is sufficient.
+  template <uint32_t kCluster = 1>
+  SGL_DEVICE static Bounds refine_bounds(
+      const TopKProblem& problem, uint32_t local_len, Smem* smem) {
+    const uint32_t tx = threadIdx.x;
+    const uint32_t coarse = smem->threshold_bin;
+    Bounds bounds{coarse_bin_lower_bound<kHistBits>(coarse),
+                  coarse_bin_lower_bound<kHistBits>(coarse + 1)};
+    // find_threshold publishes this flag before its CTA barrier. Reading the
+    // histogram here would race its first256 bins being cleared by other warps.
+    if (smem->bucket_overflow == 0) return bounds;
+    uint32_t prefix = 0, mask = 0, remain = problem.topk;
+    int shift = 24;
+    for (; shift >= 0; shift -= 8) {
+      if (tx < kRadixSize) smem->histogram[tx] = 0;
+      __syncthreads();
+      for_each_input(problem.in, local_len, [&](float val, uint32_t) {
+        const uint32_t key = extract_exact_bin(val);
+        if ((key & mask) == prefix)
+          atomicAdd(&smem->histogram[(key >> shift) & 255u], 1);
+      });
+      __syncthreads();
+      if constexpr (kCluster > 1) {
+        const auto cluster = cg::this_cluster();
+        cluster.sync();
+        if (tx < kRadixSize) {
+          const uint32_t bin = blockIdx.y * (kRadixSize / kCluster) + tx / kCluster;
+          auto* peer = cluster.map_shared_rank(&smem->histogram[bin], tx % kCluster);
+          const uint32_t value = *peer;
+          *peer = warp::reduce_sum<kCluster>(value);
+        }
+        cluster.sync();
+      }
+      if (tx == 0) {
+        uint32_t above = 0;
+        for (int bin = 255; bin >= 0; --bin) {
+          const uint32_t count = smem->histogram[bin];
+          if (above < remain && above + count >= remain) {
+            smem->threshold_bin = bin;
+            smem->count_gt = above;
+            smem->count_eq = count;
+            break;
+          }
+          above += count;
+        }
+      }
+      __syncthreads();
+      prefix |= smem->threshold_bin << shift;
+      mask |= 255u << shift;
+      remain -= smem->count_gt;
+      if (smem->count_eq <= kMaxNumTie || shift == 0) break;
+    }
+    const auto value_from_key = [](uint64_t key) {
+      if (key < 0x007FFFFFull) return -std::numeric_limits<float>::infinity();
+      if (key > 0xFF800000ull) return std::numeric_limits<float>::infinity();
+      const auto bits = static_cast<uint32_t>(key);
+      return __uint_as_float((bits & 0x80000000u) ? (bits ^ 0x80000000u) : ~bits);
+    };
+    bounds = {value_from_key(prefix), value_from_key(uint64_t(prefix) + (1ull << shift))};
+    if (tx == 0) smem->count_gt = smem->count_eq = 0;
+    __syncthreads();
+    // Peer collection atomically adds to rank zero: every rank must finish
+    // resetting its counts before any rank can publish collected candidates.
+    if constexpr (kCluster > 1) cg::this_cluster().sync();
+    return bounds;
+  }
+
   SGL_DEVICE static void find_threshold(const uint32_t topk, const uint32_t seq_len, Smem* smem) {
     const auto tx = threadIdx.x;
     constexpr uint32_t kItems = kHistSize / kBlockSize;
@@ -509,6 +583,7 @@ struct TopKRadixBase : TopKConfig {
       const auto above = seq_len - prefix_sum;
       if (above < topk && above + orig[i] >= topk) {
         smem->threshold_bin = tx * kItems + i;
+        smem->bucket_overflow = orig[i] > kMaxNumTie ? 1u : 0u;
       }
     }
     __syncthreads();
@@ -583,8 +658,9 @@ struct TopKRegister : TopKRadixBase<12> {
     // Phase 3: collect by two fp32 boundaries (raw indices; transform applied later)
     const auto topk = problem.topk;
     const auto threshold_bin = smem->threshold_bin;
-    const auto v_hi = coarse_bin_lower_bound<kHistBits>(threshold_bin + 1);
-    const auto v_lo = coarse_bin_lower_bound<kHistBits>(threshold_bin);
+    const auto bounds = TopKRadixBase<12>::template refine_bounds<1>(problem, problem.seq_len, smem);
+    const auto v_hi = bounds.hi;
+    const auto v_lo = bounds.lo;
     const auto collect = [&](float val, uint32_t idx) {
       if (val >= v_hi) {
         const auto pos = atomicAdd(&smem->count_gt, 1);
@@ -661,8 +737,9 @@ struct TopKStreaming : TopKRegister<2> {
     // v_lo <= val < v_hi (bin == threshold). This drops the F2F + bit-twiddle from
     // the second full pass over the input.
     const auto threshold_bin = smem->threshold_bin;
-    const float v_hi = coarse_bin_lower_bound<kHistBits>(threshold_bin + 1);
-    const float v_lo = coarse_bin_lower_bound<kHistBits>(threshold_bin);
+    const auto bounds = TopKRadixBase<12>::template refine_bounds<1>(problem, problem.seq_len, smem);
+    const float v_hi = bounds.hi;
+    const float v_lo = bounds.lo;
     const auto topk = problem.topk;
     for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t idx) {
       if (val >= v_hi) {
@@ -774,8 +851,9 @@ struct TopKCluster : TopKRadixBase<10> {
     // across ranks, so v_hi/v_lo are too.
     const auto topk = problem.topk;
     const auto threshold_bin = smem->threshold_bin;
-    const float v_hi = coarse_bin_lower_bound<kHistBits>(threshold_bin + 1);
-    const float v_lo = coarse_bin_lower_bound<kHistBits>(threshold_bin);
+    const auto bounds = Base::template refine_bounds<kClusterSize>(problem, local_seq_len, smem);
+    const float v_hi = bounds.hi;
+    const float v_lo = bounds.lo;
 
     // Phase 3: collect candidates. The primary scatters straight into
     // `problem.out`, the others stage into block-local `smem->tmp_out`.

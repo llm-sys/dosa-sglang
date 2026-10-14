@@ -1,0 +1,98 @@
+{
+  "model": "GLM-5.2-FP8",
+  "gpu": "8 GB200; two nodes in one NVLink domain",
+  "upstream_commit": "71de97b264b04dcd514cf904003028aefe9775c8",
+  "qualified_code_commit": "c2676b1fc6f1352c0a9fcc04474e8fb3af066a09",
+  "chunked_prefill_size": 32768,
+  "tp": 8,
+  "ep": 1,
+  "kv_cache_dtype": "fp8_e4m3",
+  "mem_fraction_static": 0.88,
+  "random_seed": 233767787,
+  "requests_per_input_per_arm": {
+    "warmup": 1,
+    "measured": 3
+  },
+  "rows": [
+    {
+      "prompt_tokens": 131072,
+      "baseline_samples_s": [
+        5.717411316931248,
+        5.714703074190766,
+        5.7168539692647755
+      ],
+      "dosa_samples_s": [
+        5.664858656004071,
+        5.676455354318023,
+        5.678703915793449
+      ],
+      "baseline_median_s": 5.7168539692647755,
+      "dosa_median_s": 5.676455354318023,
+      "speedup": 1.007116873546098
+    },
+    {
+      "prompt_tokens": 262144,
+      "baseline_samples_s": [
+        14.281079502310604,
+        14.28742008889094,
+        14.289498887956142
+      ],
+      "dosa_samples_s": [
+        12.77926121884957,
+        12.805954257026315,
+        12.806095409672707
+      ],
+      "baseline_median_s": 14.28742008889094,
+      "dosa_median_s": 12.805954257026315,
+      "speedup": 1.1156857038632464
+    },
+    {
+      "prompt_tokens": 524288,
+      "baseline_samples_s": [
+        40.12764001218602,
+        40.1196465161629,
+        40.49063182994723
+      ],
+      "dosa_samples_s": [
+        29.536901052109897,
+        29.563861994072795,
+        29.550407875329256
+      ],
+      "baseline_median_s": 40.12764001218602,
+      "dosa_median_s": 29.550407875329256,
+      "speedup": 1.357938617344344
+    },
+    {
+      "prompt_tokens": 786432,
+      "baseline_samples_s": [
+        79.99092541402206,
+        80.02005998278037,
+        80.49584250897169
+      ],
+      "dosa_samples_s": [
+        49.69991704728454,
+        49.690410079900175,
+        49.679649251978844
+      ],
+      "baseline_median_s": 80.02005998278037,
+      "dosa_median_s": 49.690410079900175,
+      "speedup": 1.6103723002911696
+    },
+    {
+      "prompt_tokens": 1048569,
+      "baseline_samples_s": [
+        132.27534888172522,
+        131.78559833439067,
+        131.68959000287578
+      ],
+      "dosa_samples_s": [
+        73.48670172784477,
+        73.36650709807873,
+        73.89277201797813
+      ],
+      "baseline_median_s": 131.78559833439067,
+      "dosa_median_s": 73.48670172784477,
+      "speedup": 1.7933258022989473
+    }
+  ]
+}

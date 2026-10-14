@@ -28,13 +28,69 @@ def get_global_graph_memory_pool() -> Optional[Any]:
 
 
 def set_global_graph_memory_pool(val: Any) -> None:
-    get_resources().graph_memory_pool = val
+    resources = get_resources()
+    owner = resources.graph_memory_pool_owner
+    if owner is not None and owner.id != val:
+        resources.graph_memory_pool_owner = None
+        resources.graph_memory_pool_owner_device = None
+    resources.graph_memory_pool = val
 
 
-def get_or_create_global_graph_memory_pool(device_module: Any) -> Any:
+def get_global_graph_memory_pool_owner(pool: Any, device: Any) -> Optional[Any]:
+    """Only expose an owner created here for this handle and CUDA device.
+
+    An externally installed legacy handle cannot be adopted as a MemPool via
+    the public API. Such handles retain their original capture-only behavior.
+    """
+    resources = get_resources()
+    owner = resources.graph_memory_pool_owner
+    if (
+        owner is not None
+        and owner.id == pool == resources.graph_memory_pool
+        and getattr(device, "type", None) == "cuda"
+        and device.index == resources.graph_memory_pool_owner_device
+    ):
+        return owner
+    return None
+
+
+def get_or_create_global_graph_memory_pool(
+    device_module: Any, *, allow_explicit_pool: bool = True
+) -> Any:
     """Return the shared graph memory pool, creating it on first use so
     later backends reuse the same handle."""
     resources = get_resources()
     if resources.graph_memory_pool is None:
-        resources.graph_memory_pool = device_module.graph_pool_handle()
+        import torch
+
+        if (
+            allow_explicit_pool
+            and device_module is torch.cuda
+            and hasattr(torch.cuda, "MemPool")
+            and hasattr(torch.cuda, "use_mem_pool")
+            and torch.cuda.memory.get_allocator_backend() == "native"
+        ):
+            owner = torch.cuda.MemPool()
+            resources.graph_memory_pool_owner = owner
+            resources.graph_memory_pool_owner_device = torch.cuda.current_device()
+            resources.graph_memory_pool = owner.id
+        else:
+            resources.graph_memory_pool = device_module.graph_pool_handle()
     return resources.graph_memory_pool
+
+
+def release_unused_global_graph_memory_pool(pool: Any) -> None:
+    """Release our cache only after the last graph/context releases its pool.
+
+    Full graphs also keep a Python owner lease, so replacing the global handle
+    cannot invalidate a graph retained by another caller.
+    """
+    resources = get_resources()
+    owner = resources.graph_memory_pool_owner
+    if owner is None or owner.id != pool or resources.graph_memory_pool != pool:
+        return
+    import torch
+
+    with torch.cuda.device(resources.graph_memory_pool_owner_device):
+        if owner.use_count() == 1:
+            set_global_graph_memory_pool(None)

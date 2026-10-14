@@ -281,3 +281,8 @@ artifacts/
 
 # Internal, non-published docs
 internal-docs/
+
+# Local DoSA reproduction artifacts
+.dosa_topk/
+ttft-inputs/
+ttft-results/
